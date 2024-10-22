@@ -1,0 +1,134 @@
+import requests
+import time
+from bs4 import BeautifulSoup
+import re
+import json
+import random
+import logging
+
+# logging 모듈 초기화
+logging.basicConfig(level=logging.INFO)
+
+def hotel_info_crawling(request):
+    request_json = request.get_json(silent=True) or {}
+    keyword_list = request_json.get('calls', [])
+    replies = []
+
+    logging.info(f"Request JSON: {request_json}")
+    logging.info(f"Keyword List: {keyword_list}")
+
+    for keywords in keyword_list:
+        keyword = keywords[0]
+
+        cookies = {
+            'NNB': '3Y4Z4UAEZXOGG',
+            'ASID': 'd3f4944d000001890aa81c4b0000005b',
+            '_ga': 'GA1.1.295825726.1699821317',
+            '_ga_WQQ4M03WB8': 'GS1.1.1706231984.1.0.1706231986.0.0.0',
+            'nid_inf': '-2109932498',
+            'NID_JKL': 'seV6lQtb4QesG3sbRabFzsHCbXTaNgDCZQVqbmEeUVA=',
+            'page_uid': 'iBLtOlpzL8wssuhQjd4ssssstY0-038487',
+        }
+        headers = {
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,imageapng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'cache-control': 'no-cache',
+            'pragma': 'no-cache',
+            'referer': 'https://www.naver.com/',
+            'sec-ch-ua': '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+            'sec-ch-ua-arch': '"arm"',
+            'sec-ch-ua-bitness': '"64"',
+            'sec-ch-ua-full-version-list': '"Google Chrome";v="123.0.6312.87", "Not:A-Brand";v="8.0.0.0", "Chromium";v="123.0.6312.87"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-model': '""',
+            'sec-ch-ua-platform': '"macOS"',
+            'sec-ch-ua-platform-version': '"13.6.2"',
+            'sec-ch-ua-wow64': '?0',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        }
+        params = {
+            'where': 'nexearch',
+            'sm': 'top_hty',
+            'fbm': '0',
+            'ie': 'utf8',
+            'query': f'{keyword}',
+        }
+
+        max_retries = 3
+        retry_count = 0
+        success = False
+
+        while retry_count < max_retries and not success:
+            try:
+                time.sleep(0.5)
+                response = requests.get('https://search.naver.com/search.naver', params=params, cookies=cookies, headers=headers)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+
+                    script_tag = soup.find('script',
+                                        string=re.compile(r'naver\.search.*.__APOLLO_STATE__\s*=\s*(\{.*?\});'))
+                    if script_tag:
+                        script_content = script_tag.string
+                        json_text_match = re.search(r'naver\.search.*.__APOLLO_STATE__\s*=\s*(\{.*?\});', script_content,
+                                                    re.DOTALL)
+                        if json_text_match:
+                            json_text = json_text_match.group(1)
+                            hotel_data = json.loads(json_text)
+
+                            # 경로 추출
+                            visitor_review_key = next((key for key in hotel_data.keys() if key.startswith('VisitorReview')), None)
+                            visitor_review_key_2 = next((key for key in hotel_data.keys() if key.startswith('VisitorReviews')), None)
+
+                            thumb_review = []
+                            if visitor_review_key_2:
+                                thumb_review = [value['review'].replace('\n', '').replace('<b>', '').replace('</b>', '') for key, value in hotel_data.items() if key.startswith('VisitorReviews') and 'review' in value]
+                            elif visitor_review_key:
+                                thumb_review = [value['body'].replace('\n', '') for key, value in hotel_data.items() if key.startswith('VisitorReview') and 'body' in value]
+
+                            mining_result = {}
+                            if visitor_review_key:
+                                for key, value in hotel_data.items():
+                                    if 'body' in value:
+                                        body = value['body'].replace('\n', '').replace('<b>', '').replace('</b>', '')
+                                        themes = value.get("themes", [])
+                                        cleaned_themes = [{theme["pattern"].replace('\n', '').replace('<b>', '').replace('</b>', ''): theme["miningValue"]} for theme in themes]
+                                        mining_result[body] = cleaned_themes
+
+                            replies.append(mining_result)
+
+                        else:
+                            replies.append({'hotel': keyword, 'error': "json_text_match 패턴 점검 필요"})
+                            logging.info("json_text_match 패턴 점검 필요")
+
+                    else:
+                        replies.append({'hotel': keyword, 'error': "json값 확인 불가"})
+                        logging.info("json값 확인 불가")
+
+                    success = True
+                else:
+                    error_message = f"Failed to fetch data status code: {response.status_code}"
+                    logging.error(error_message)
+                    replies.append({'hotel': keyword, 'error': error_message})
+                    break
+
+            except Exception as e:
+                retry_count += 1
+                logging.error(f"Attempt {retry_count} failed for keyword: {keyword} with error: {str(e)}")
+                if retry_count < max_retries:
+                    sleep_time = random.randint(3, 10)
+                    logging.info(f"Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    replies.append({'hotel': keyword, 'error': str(e)})
+                    break
+
+    while len(replies) < len(keyword_list):
+        replies.append({})
+
+    logging.info(f"Replies: {replies}")
+    return json.dumps({"replies": replies}, ensure_ascii=False)
