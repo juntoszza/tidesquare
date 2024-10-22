@@ -1,0 +1,69 @@
+from bs4 import BeautifulSoup
+import requests
+import re
+import time
+import json
+
+def save_keywords_data(request):
+    request_json = request.get_json(silent=True) or {}
+    calls = request_json.get('calls', [])
+
+    replies = []
+
+    for call in calls:
+        call = call[0]
+        try:
+            response = requests.get(
+                f'https://search.naver.com/search.naver?where=nexearch&sm=top_hty&fbm=0&ie=utf8&query={call}',
+                headers={
+                    'authority': 'search.naver.com',
+                    'pragma': 'no-cache',
+                    'cache-control': 'no-cache',
+                    'sec-ch-ua': '" Not;A Brand";v="99", "Google Chrome";v="91", "Chromium";v="91"',
+                    'accept': 'application/json, text/plain, */*',
+                    'urlprefix': '/api',
+                    'sec-ch-ua-mobile': '?0',
+                    'logic': 'PART',
+                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'sec-fetch-site': 'same-origin',
+                    'sec-fetch-mode': 'cors',
+                    'sec-fetch-dest': 'empty',
+                    'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6,zh;q=0.5',
+                    'cookie': 'NNB=NVV5OO7EOEVV4; NRTK=ag#all_gr#1_ma#-2_si#0_en#0_sp#0; _ga=GA1.2.1225184444.1584365530; ASID=27789460000001718f31904100000058; AD_SHP_BID=2; NDARK=Y; viewType=list; nx_ssl=2; _shopboxeventlog=false; sus_val=S3KSYAH/+vRxnJNcpDVS8eO3; spage_uid=',
+                }
+            )
+            time.sleep(0.5)
+
+            if response.status_code != 200:
+                replies.append({
+                    call: ["Error", f"Request failed with status code {response.status_code}"]
+                })
+                continue
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            scripts = soup.find_all("script")
+            script_text = [i for i in scripts if "인기주제" in str(i)]
+            if script_text:
+                script_text = script_text[0].get_text()
+                pattern = re.compile(r'"content":\s*"([^"]*)"')
+                popular_tags = pattern.findall(script_text)
+
+                if popular_tags:
+                    # '인기 카페글'이나 '인기글'을 제외한 태그만을 필터링
+                    filtered_tags = [tag for tag in popular_tags if tag not in ['인기 카페글', '인기글']]
+                    
+                    if filtered_tags:
+                        replies.append({'values': filtered_tags[1:]})
+                    else:
+                        replies.append({'values': []})
+                else:
+                    replies.append({'values': []})
+            else:
+                replies.append({'values': []})
+
+        except Exception as e:
+            replies.append({call: ["Error", str(e)]})
+
+        time.sleep(1)
+
+    return json.dumps({"replies": replies}, ensure_ascii=False)
