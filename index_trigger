@@ -1,0 +1,48 @@
+import json
+import os
+from google.cloud import storage, aiplatform
+
+def process_file(event, context):
+    # GCS에서 파일 정보 가져오기
+    bucket_name = event['bucket']
+    file_name = event['name']
+    
+    # GCS 클라이언트 생성
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    
+    # 파일 내용을 가져와서 줄 단위로 나눔
+    file_content = blob.download_as_string().decode('utf-8')
+    json_objects = file_content.splitlines()
+
+    # 각 줄을 개별적으로 JSON으로 파싱
+    embeddings = []
+    for obj in json_objects:
+        try:
+            json_obj = json.loads(obj)
+            embeddings.append(json_obj['embedding'])  # 'embedding' 키에서 데이터를 추출
+        except json.JSONDecodeError as e:
+            print(f"JSONDecodeError: {e}")
+            continue
+
+    # Vertex AI 또는 다른 색인 서비스 호출
+    aiplatform.init(project='keyword-data-373606', location='asia-northeast3')
+
+
+    index = aiplatform.MatchingEngineIndex.create(
+        display_name='gpt_embedding_test_v2',
+        contents=embeddings,
+        dimensions=len(embeddings[0]),  
+        approximate_neighbors_count=200,
+    )
+    
+    # 엔드포인트 생성
+    endpoint = aiplatform.Endpoint.create(
+        display_name='embedding_test_v2',
+        description='자동 엔드포인트 인덱싱 테스트',
+        deployed_models=[index],
+    )
+    
+    print(f"Index created: {index.resource_name}")
+    print(f"Endpoint created: {endpoint.resource_name}")
