@@ -1,0 +1,77 @@
+from bs4 import BeautifulSoup
+import requests
+from datetime import datetime
+import json
+import time  
+
+def org_navershop(request):
+    request_json = request.get_json(silent=True) or {}
+    calls = request_json.get('calls', [])
+
+    replies = []
+
+    for call in calls:
+        call = call[0]
+        try:
+            response = requests.get(
+                f'https://search.naver.com/search.naver?where=nexearch&sm=top_hty&fbm=0&ie=utf8&query={call}',
+                headers={
+                    'authority': 'search.naver.com',
+                    'pragma': 'no-cache',
+                    'cache-control': 'no-cache',
+                    'sec-ch-ua': '" Not;A Brand";v="99", "Google Chrome";v="91", "Chromium";v="91"',
+                    'accept': 'application/json, text/plain, */*',
+                    'urlprefix': '/api',
+                    'sec-ch-ua-mobile': '?0',
+                    'logic': 'PART',
+                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'sec-fetch-site': 'same-origin',
+                    'sec-fetch-mode': 'cors',
+                    'sec-fetch-dest': 'empty',
+                    'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6,zh;q=0.5',
+                    'cookie': 'NNB=NVV5OO7EOEVV4; NRTK=ag#all_gr#1_ma#-2_si#0_en#0_sp#0; _ga=GA1.2.1225184444.1584365530; ASID=27789460000001718f31904100000058; AD_SHP_BID=2; NDARK=Y; viewType=list; nx_ssl=2; _shopboxeventlog=false; sus_val=S3KSYAH/+vRxnJNcpDVS8eO3; spage_uid=',
+                }
+            )
+            
+            time.sleep(0.5)
+
+            if response.status_code != 200:
+                replies.append({
+                    call: ["Error", f"Request failed with status code {response.status_code}"]
+                })
+                continue
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            section = soup.select_one('section.sc_new.sp_nshop._shopping_root')
+            
+            product_lists = section.select('ul.list_divide') if section else [] 
+            
+            reply_data = [] #단일 호출에 대한 응답을 담을 배열 
+
+            for index, product in enumerate(product_lists, start=1):
+                # current_time = datetime.now().strftime("%y-%m-%d %H:%M:%S")
+                data = {
+                    'keyword': call,
+                    'ad/org': 'ad' if product.select_one('.shop_product.type_ad') else 'org',
+                    'store': product.select_one('.txt_area').get_text(strip=True) if product.select_one('.txt_area') else '정보 없음',
+                    'title': product.select_one('.title').get_text(strip=True),
+                    'price': product.select_one('.price strong').get_text(strip=True) if product.select_one('.price strong') else '가격 정보 없음',
+                    'purchase': product.select_one('.reaction .data:nth-of-type(1) em').get_text(strip=True) if product.select_one('.reaction .data:nth-of-type(1) em') else '0',
+                    'review': product.select_one('.reaction .data:nth-of-type(2) em').get_text(strip=True) if product.select_one('.reaction .data:nth-of-type(2) em') else '0',
+                    'wish': product.select_one('.reaction .data:nth-of-type(3) em').get_text(strip=True) if product.select_one('.reaction .data:nth-of-type(3) em') else '0',
+                    'rank': index,
+                    'code': product.select_one('li.box')['data-nvmid'],
+                    'url' : product.select_one('div.product_info > a')['href']
+                    # 'created_at': current_time
+                }    
+                reply_data.append(data)
+            
+            replies.append(reply_data)
+
+
+        except Exception as e:
+            replies.append({call: ["Error", str(e)]})
+
+        time.sleep(1)
+   
+    return json.dumps({"replies": replies}, ensure_ascii=False)
