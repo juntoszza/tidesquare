@@ -1,0 +1,211 @@
+# import os
+# import json
+# import pandas as pd
+# from flask import Flask, request, jsonify
+# from langchain_openai import ChatOpenAI
+# from langchain_core.output_parsers import StrOutputParser
+# from langchain_core.prompts import PromptTemplate
+# from jira import JIRA
+# from google.cloud import secretmanager, bigquery
+
+# import asyncio
+# import nest_asyncio
+
+########################### #################################################################################
+import asyncio
+import nest_asyncio
+import requests
+from requests.auth import HTTPBasicAuth
+import json
+from datetime import datetime, timedelta
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import PromptTemplate
+from google.cloud import secretmanager, bigquery
+import logging
+import os
+import pandas as pd
+from flask import Flask, request, jsonify
+import pytz
+
+# Logging 설정
+logging.basicConfig(level=logging.INFO)
+
+# nest_asyncio 적용
+nest_asyncio.apply()
+
+# Google Secret Manager를 사용하여 OpenAI API 키 가져오기
+def access_secret(project_id, secret_name):
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8") 
+
+# API KEY 정보로드
+os.environ['OPENAI_API_KEY'] = access_secret('1004897053426','openai_apikey' ) #secret manager에서 생성한 보안 비밀 확인. 
+
+
+# LLM 객체 생성
+model = ChatOpenAI(
+    temperature=0.3,  # 창의성 (0.0 ~ 2.0)
+    model_name="gpt-4o-mini"  # 모델명
+    # model_name="gpt-3.5-turbo" #
+    # model_name="gpt-4o"  # 모델명
+)
+
+
+# 빅쿼리 클라이언트 객체 생성
+client = bigquery.Client()
+
+
+# 비동기 처리 함수 
+
+async def process_table_data(table_id):
+   
+    # BigQuery 데이터 쿼리
+    query = f'''
+    SELECT
+        keywords,
+        #id, 
+        hotel_id,
+        status,
+        result
+    FROM `{table_id}`
+    # WHERE status = '생성대기'
+    WHERE keywords = 'Hotel New Otani Tokyo EXECUTIVE HOUSE ZEN'
+    # LIMIT 1 # 크롤링 결과 여러개인 경우 대비해서 삽입 (1개의 결과에 대해서만 크롤링 결과가 중복인 경우 중복인 만큼 비동기호출해서 최종결과테이블에 삽입됨.) - 1개 테스트 한해서만 적용 
+    # WHERE keyword IN (
+    #     'JW Marriott Jeju Resort & Spa', 'The St. Regis Singapore', 'Signiel Seoul'
+    # )
+    
+    '''
+    # 컨텐츠 데이터 추출 및 병합
+    df = client.query(query).to_dataframe()
+
+    # BigQuery 업로드 테이블 지정
+    upload_table_id = "keyword-data-373606.out_select.contents"
+
+    tasks = [process_keyword_row(row, i) for i, (_, row) in enumerate(df.iterrows())]
+    results = await asyncio.gather(*tasks)
+
+    # None 값 제거 
+    results = [result for result in results if result is not None] 
+    if not results: 
+        logging.warning("No valid content generated")
+        return 
+        
+    processed_data = pd.DataFrame(results)
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED
+    )
+    load_job = client.load_table_from_dataframe(processed_data, upload_table_id, job_config=job_config)
+    load_job.result()
+
+async def process_keyword_row(row, index): 
+
+    # 모든 result 컬럼 데이터를 병합하여 전역 변수로 정의
+    content_input = {'content': row['result']}
+
+    # 템플릿 작성 (정보 추출 버전)
+    template = """
+    당신은 럭셔리 호텔 전문 에디터로, 매력적인 호텔 소개글을 작성하는 전문가입니다.
+    럭셔리하고 세련된 톤으로 작성해주세요. 감각적인 형용사를 사용하되, 과장되지 않도록 주의해주세요.
+    호텔 정보는 [content]를 참고해주세요.
+    출력 양식은 [Format]양식을 지켜주세요. 특히 에디터 추천 포인트는 3개만 출력되도록 해주세요. 
+    출력 결과는 한글로 최대한 자연스럽게 번역해주었으면 좋겠어요.
+
+    호텔정보 컨텐츠:
+    {content}
+
+    FORMAT:
+    
+        {{
+        "title": "148년간 자리를 지켜 온 호텔의 품격, 만다린 오리엔탈 방콕",
+        "intro": "짜오프라야 강변에 위치한 만다린 오리엔탈 방콕은 세월을 관통하는 우아함과 현대적인 편안함이 공존하는 특별한 호텔입니다. 1876년에 문을 연 이곳은 여행자에게 진정한 태국의 매력을 전합니다. 전 객실 24시간 버틀러 서비스가 제공되며 다양한 객실과 스위트 룸은 고풍스러우면서도 현대적인 분위기를 자아냅니다. 태국에서 처음으로 문을 연 스파를 비롯해 럭셔리한 야외 수영장, 다채로운 웰니스 및 투어 프로그램, 키즈 클럽까지 마련되어 있으며 미쉐린 스타 셰프의 다이닝도 자리합니다. 만다린 오리엔탈 방콕에서 잊을 수 없는 여행의 추억을 만들어 보세요.",
+        "point": ["148년 역사를 자랑하는 방콕 최고의 호텔", "전 객실 24시간 버틀러 서비스 제공", "방콕 역사와 문화 체험이 가능한 다양한 프로그램"],
+        "room": "만다린 오리엔탈 방콕의 객실은 클래식하면서도 현대적인 매력이 묻어납니다. 객실은 일반 룸과 스위트 룸으로 나뉘며 전망은 시티뷰와 짜오프라야강 리버뷰를 선택할 수 있습니다. 전 객실에 바닥부터 천장까지 어이지는 통유리가 있어 탁 트인 전망이 펼쳐집니다. 만다린 오리엔탈 방콕에서는 객실을 예약하는 모든 투숙객에게 24시간 버틀러 서비스를 제공하고 있어 최상의 편안함을 누릴 수 있어요. 스위트 룸에는 발코니가 갖추어져 있으며 앰배서더 스위트 룸과 로얄 스위트 룸의 경우 전용 엘리베이터를 통해 접근 가능해 더욱 프라이빗합니다.",
+        "facility": "만다린 오리엔탈 방콕은 다양한 부대시설을 제공합니다. 1993년 오픈해 태국 최초의 호텔 스파로 이름을 알린 '오리엔탈 스파'에서 피로를 풀며 힐링해 보세요. 성인풀과 키즈풀을 갖춘 야외 수영장에는 방갈로와 선베드가 마련되어 있으며 넓은 규모를 자랑합니다. 오후 4시마다 찾아오는 무료 아이스크림 카트도 놓치지 마세요. 또한 호텔에서는 풍부한 프로그램을 제공해 방콕을 한층 더 깊고 다채롭게 체험하도록 돕습니다. 무료 모닝 요가 및 무에타이 수업이 열리며 이외에도 반나절 명소 투어, 꽃 시장 투어, 숨은 골목까지 탐험하는 자전거 투어, 왕궁으로 가는 일몰 크루즈, 연꽃잎 접기 클래스, 태국 요리 쿠킹 클래스 등에 참여할 수 있어요. 아이와 함께라면 3-12세 어린이를 위한 키즈 클럽도 이용해 보세요.",
+        "dining": "호텔에는 세계적인 다이닝이 자리하고 있습니다. 미쉐린 2스타를 받은 셰프가 선보이는 프랑스 요리는 'Le Normandie'에서 맛볼 수 있어요. 조식을 포함한 올데이 다이닝 'The Verandah'에서는 인터내셔널 요리를 선보입니다. 'Sala Rim Naam'에서는 식사를 하며 태국 전통 공연을 감상해 보세요. 또한 1930년대 상하이를 모티브로 하는 중식 레스토랑 'The China House', 미쉐린 스타 셰프의 일본 가이세키 다이닝 'Kinu by Takagi', 짜오프라야강 옆의 정통 타이 퀴진 'Terrace Rim Naam' 등 풍부한 미식 탐험이 가능합니다. 'Author's Lounge'에서는 달콤한 애프터눈 티를 즐겨 보세요. 전 세계 재즈 애호가들의 성지, 1952년 문을 연 방콕 최초의 재즈 공연장 'The Bamboo Bar'에서는 수준급 바텐더들이 감각적인 칵테일을 제공합니다.",
+        "location": "만다린 오리엔탈 방콕은 짜오프라야 강변 옆에 위치하는 방콕 최고의 호텔입니다. 호텔이 있는 지역은 방콕의 역사적 중심지인 차오렌크렁 지구로 풍부한 문화유산과 현대적인 감성이 조화를 이루고 있습니다. 호텔 주변에는 복합문화공간 '웨어하우스 30'부터 갤러리, 서점, 카페, 공예품 가게들이 모여 있어 활기찬 분위기를 자아냅니다. 현대적 감각과 전통이 어우러진 이 지역은 방콕의 강변 재생 프로젝트의 중심지로서 문화와 예술을 사랑하는 이들에게 이상적입니다."
+        }}
+        
+    """
+
+    # 문자열 출력 파서 초기화
+    # output_parser = StrOutputParser()
+
+    # JSON 출력 파서 초기화
+    output_parser = JsonOutputParser()
+
+    # 프롬프트 템플릿을 이용하여 프롬프트를 생성
+    prompt = PromptTemplate.from_template(template)
+
+    # 체인 구성: 프롬프트 | 모델객체 | 아웃풋파서
+    chain = prompt | model | output_parser 
+
+    try: 
+        # LangChain 작업 수행 
+        result = await chain.ainvoke(content_input)
+
+        processed_data = {
+        "paragon_id": int(row['hotel_id']) if row['hotel_id'].isdigit() else None,
+        "created_at": datetime.now(pytz.timezone('Asia/Seoul')).isoformat(),
+        "version": 0,
+        "title": result.get('title', '콘텐츠 생성에 실패하였습니다.'),
+        "intro": result.get('intro', '콘텐츠 생성에 실패하였습니다.'),
+        "point": "\n".join(result.get('point', ['콘텐츠 생성에 실패하였습니다.'])),
+        "room": result.get('room', '콘텐츠 생성에 실패하였습니다.'),
+        "facility": result.get('facility', '콘텐츠 생성에 실패하였습니다.'),
+        "dining": result.get('dining', '콘텐츠 생성에 실패하였습니다.'),
+        "location": result.get('location', '콘텐츠 생성에 실패하였습니다.')
+        } 
+
+        if all(value == '콘텐츠 생성에 실패하였습니다.' for value in processed_data.values()):
+            logging.warning(f"Content generation failed for hotel_id: {row['hotel_id']}")
+            return None
+
+        return processed_data
+
+    except Exception as e:
+        logging.error(f"Error processing row: {e}")
+        return None
+
+    
+
+# 'InterContinental Phu Quoc Long Beach Resort'
+# "Mandarin Oriental, Bangkok",
+# "Conrad Seoul",
+# "Grand InterContinental Seoul Parnas, an IHG Hotel",
+# "Signiel Seoul",
+# "The Ritz-Carlton, Osaka",
+# "Capella Ubud, Bali",
+# "The St. Regis Singapore",
+# "InterContinental Danang Sun Peninsula Resort",
+# "JW Marriott Jeju Resort & Spa" 
+
+
+# Google Cloud Functions HTTP 핸들러
+def main(request):
+    try:
+        logging.info("Request received")
+        # 요청 본문에서 BigQuery 테이블 ID를 가져옴
+        data = request.get_json(silent=True)
+        logging.info("Request JSON: %s", data)
+
+        if not data or 'table_id' not in data:
+            logging.error("Invalid or missing table_id in request")
+            return jsonify({"error": "Invalid or missing table_id in request"}), 400
+
+        table_id = data['table_id']  # BigQuery 테이블 ID
+        logging.info("Processing table_id: %s", table_id)
+
+        # 비동기 작업 실행
+        asyncio.run(process_table_data(table_id))
+
+        return jsonify({"message": f"Data from {table_id} processed successfully"}), 200
+    except Exception as e:
+        logging.exception("Error occurred during request processing")
+        return jsonify({"error": str(e)}), 500
