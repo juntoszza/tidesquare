@@ -1,0 +1,228 @@
+import google.auth
+from google.auth.transport.requests import Request
+from google.oauth2 import id_token
+from google.cloud import bigquery
+import asyncio
+import aiohttp
+import json
+import os
+
+# 액세스 토큰을 가져오는 함수
+def get_access_token(audience):
+    credentials, _ = google.auth.default()
+    credentials = credentials.with_scopes(['https://www.googleapis.com/auth/cloud-platform'])
+    auth_request = Request()
+    credentials.refresh(auth_request)
+    auth_token = id_token.fetch_id_token(auth_request, audience)
+    return auth_token
+
+# 크롤링 함수를 비동기적으로 호출하는 함수
+async def send_request_to_crawling_function(url, token, data_list):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        'Content-Type': 'application/json'
+    }
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            session.post(url, headers=headers, json=data, ssl=False)
+            for data in data_list
+        ]
+        responses = await asyncio.gather(*tasks)
+        
+        results = []
+        for response in responses:
+            response_text = await response.text()
+            try:
+                response_json = json.loads(response_text)
+                results.extend(response_json.get('results', []))
+            except Exception as e:
+                results.append({"error": str(e)})
+        
+        return results
+
+# BigQuery에 배치로 데이터 삽입하는 함수 (비동기 적재량 limit 설정)
+def batch_insert_to_bigquery(bq_client, project_id, dataset_id, table_id, results, batch_size=100):
+    output_table_id = f'{project_id}.{dataset_id}.{table_id}'
+    
+    job_config = bigquery.LoadJobConfig(
+        schema=[
+            bigquery.SchemaField("keywords", "STRING"),
+            # bigquery.SchemaField("content_id", "STRING"),
+            bigquery.SchemaField("hotel_id", "STRING"),
+            bigquery.SchemaField("status", "STRING"),
+            bigquery.SchemaField("result", "STRING")
+        ],
+        write_disposition='WRITE_APPEND'
+    )
+
+    # result 컬럼에 content, info_blocks를 하나의 JSON으로 합침
+    # 전처리: ensure_ascii=False로 유니코드 이스케이프 제거, \n 제거
+    for result in results:
+        # hotel_name 필드가 있다면 제거
+        if "hotel_name" in result:
+            del result["hotel_name"]
+            
+        # 임의로 추가되는 error 컬럼 제거 
+        if "error" in result:
+            del result["error"] 
+
+        content = result.get("content", "")
+        info_blocks = result.get("info_blocks", {})
+
+        # 하나의 dict로 결합
+        combined_result = {
+            "content": content,
+            "info_blocks": info_blocks
+        }
+
+        # JSON 직렬화 (ensure_ascii=False로 유니코드 이스케이프 방지)
+        result_str = json.dumps(combined_result, ensure_ascii=False)
+
+        # 불필요한 이스케이프 및 개행 제거를 위해 한 번 파싱 후 다시 덤프
+        # (이 과정을 통해 \u, \n 등 불필요한 이스케이프를 최소화)
+        parsed_result = json.loads(result_str)
+        result_str = json.dumps(parsed_result, ensure_ascii=False)
+        
+
+         # \uXXXX 제거 및 \ 개행문자 제거
+        result_str = result_str.replace('\\u', '').replace('\\', '')
+        result_str = result_str.replace('\n', ' ').strip()
+
+        # 최종 result 컬럼에 세팅
+        result["result"] = result_str
+
+        # 기존 content, info_blocks 키는 제거하여 불필요한 컬럼 삽입 방지
+        if "content" in result:
+            del result["content"]
+        if "info_blocks" in result:
+            del result["info_blocks"]
+
+        # id -> content_id, paragon_id -> hotel_id
+        # if "id" in result:
+        #     result["content_id"] = result.pop("id")
+        if "paragon_id" in result:
+            result["hotel_id"] = result.pop("paragon_id")
+
+    # 배치 단위로 데이터 적재
+    for i in range(0, len(results), batch_size):
+        batch = results[i:i+batch_size]
+        try:
+            job = bq_client.load_table_from_json(
+                batch,
+                output_table_id,
+                job_config=job_config
+            )
+            job.result()  # 작업 완료 대기
+            print(f"배치 {i//batch_size + 1} 적재 완료")
+        except Exception as e:
+            print(f"배치 적재 중 오류 발생: {e}")
+
+# 메인 함수
+def main(request):
+    request_json = request.get_json()
+    
+    # # 요청에서 필요한 파라미터 직접 정의 (json 호출용)
+    # project_id = request_json.get('project_id', 'keyword-data-373606')
+    # input_dataset_id = request_json.get('input_dataset_id', 'working_htlContent')
+    # input_table_id = request_json.get('input_table_id', 'keywords_table')
+    # input_column_name = request_json.get('input_column_name', 'keywords')
+    # output_dataset_id = request_json.get('output_dataset_id', input_dataset_id)
+    # output_table_id = request_json.get('output_table_id', 'scraping_results')
+
+    project_id = 'select-lux'
+    input_dataset_id = 'in_select'
+    input_table_id = 'hotels'
+    input_column_name = 'hotel_name_en'
+    output_dataset_id = 'out_select'
+    output_table_id = 'scraping_results'
+    url = 'https://asia-northeast3-select-lux.cloudfunctions.net/forbes_crawling'  # B 함수의 URL
+    
+
+    # BigQuery 클라이언트 초기화
+    bq_client = bigquery.Client()
+
+    # 입력 데이터 쿼리
+    input_query = f"""
+    SELECT 
+    DISTINCT 
+    # id,
+    paragon_id, 
+    status,
+    {input_column_name}
+    FROM `{project_id}.{input_dataset_id}.{input_table_id}`
+    # WHERE status = '생성대기'
+    WHERE hotel_name_en = 'Montage Kapalua Bay' #테스트용 
+    # WHERE hotel_name_en IN ('Pan Pacific Singapore','Hotel New Otani Tokyo EXECUTIVE HOUSE ZEN')
+    """
+    
+
+    query_job = bq_client.query(input_query)
+
+    input_keywords = [dict(row) for row in query_job]
+
+    # 에러 방지: input_keywords가 비어있을 경우 예외 처리
+    if not input_keywords:
+        return json.dumps({
+            "status": "error",
+            "message": "No keywords found in input query."
+        })
+
+    instance = len(input_keywords)  # 비동기 요청 인스턴스 수 (키워드 개수만큼 )
+    
+    # 키워드를 instance 수만큼 분배
+    keyword_batches = [input_keywords[i:i+instance] for i in range(0, len(input_keywords), instance)]
+
+    # 액세스 토큰 생성
+    access_token = get_access_token(url)
+
+    all_results = []
+    for batch in keyword_batches:
+        # 각 키워드에 대한 요청 데이터 준비
+        data_list = [
+            {
+                "project_id": project_id,
+                "input_dataset_id": input_dataset_id,
+                "input_table_id": input_table_id,
+                "input_column_name": input_column_name,
+                "output_dataset_id": output_dataset_id,
+                "output_table_id": output_table_id,
+                "keyword": row[input_column_name], 
+                # "id": row["id"], 
+                "paragon_id": row["paragon_id"], 
+                "status": row["status"] 
+            }
+            for row in batch
+        ]
+
+        # 비동기적으로 크롤링 함수 호출
+        results = asyncio.run(send_request_to_crawling_function(url, access_token, data_list))
+
+        # 결과에 id, paragon_id, status, keyword 다시 매핑
+        # 응답 순서와 data_list 순서는 일치한다고 가정
+        for res, data_item in zip(results, data_list):
+            # 응답 결과에 키워드, id, paragon_id, status 추가
+            res["keywords"] = data_item["keyword"]
+            # res["id"] = data_item["id"]
+            res["paragon_id"] = data_item["paragon_id"]
+            res["status"] = data_item["status"]
+        all_results.extend(results)
+
+    # 결과를 BigQuery에 삽입
+    batch_insert_to_bigquery(
+        bq_client,
+        project_id,
+        output_dataset_id,
+        output_table_id,
+        all_results
+    )
+
+    return json.dumps({
+        "status": "success",
+        "processed_items": len(all_results),
+        "input_keywords_count": len(input_keywords)
+    })
+
+# Cloud Function에서 호출될 진입점 함수
+def cloud_function_entry_point(request):
+    return main(request)
