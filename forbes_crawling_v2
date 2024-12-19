@@ -1,0 +1,345 @@
+from google.cloud import bigquery
+import json
+from playwright.sync_api import sync_playwright
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
+import subprocess
+import concurrent.futures
+import logging
+import time
+ 
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def install_chromium():
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        logger.info("Chromium이 성공적으로 설치되었습니다.")
+    except Exception as e:
+        logger.error(f"Chromium 설치 중 오류 발생: {e}")
+
+def check_scrapability(url):
+    try:
+        # URL 파싱
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+        # robots.txt 확인
+        rp = RobotFileParser()
+        rp.set_url(f"{base_url}/robots.txt")
+        rp.read()
+
+        # User-agent 설정
+        user_agent = 'MyBot'
+
+        # robots.txt에서 허용 여부 확인
+        if not rp.can_fetch(user_agent, url):
+            return False, "robots.txt에 의해 차단됨"
+
+        # 웹사이트 응답 확인
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            response = page.goto(url)
+
+            if response.status >= 400:
+                browser.close()
+                return False, f"HTTP 상태 코드: {response.status}"
+
+            # JavaScript 렌더링 후 콘텐츠 확인
+            page.wait_for_load_state('domcontentloaded')
+            content = page.content()
+
+            browser.close()
+
+        if "접근 거부" in content or "Access Denied" in content:
+            return False, "접근이 거부됨"
+
+        return True, "스크래핑 가능"
+
+    except Exception as e:
+        return False, f"오류 발생: {str(e)}"
+
+def scrape_forbestravelguide(page, keyword):
+    # 데이터 저장을 위한 딕셔너리
+    info_blocks_dict = {}
+    hotel_name = '-'
+    content = '-'
+
+    def close_overlays(page):
+        selectors = [
+            '#cookieConsentAgree',
+            '.modal-close-button',
+        ]
+        for selector in selectors:
+            try:
+                element = page.locator(selector)
+                if element.is_visible():
+                    element.click()
+                    page.wait_for_load_state('domcontentloaded')
+            except Exception as e:
+                print(f"오버레이 닫기 중 오류 발생 ({selector}): {e}")
+
+    close_overlays(page)
+
+    # 뷰포트 크기 설정
+    page.set_viewport_size({"width": 1920, "height": 1080})
+
+    # 검색 입력 필드 선택자 수정
+    search_selector = '#heroSearch input[name="phrase"][placeholder="Where do you want to go?"]'
+    search_input = page.locator(search_selector)
+    # 요소가 가시화될 때까지 대기
+    search_input.wait_for(state='visible', timeout=10000)
+
+    # 검색어 입력
+    search_input.fill(keyword)
+    search_input.press('Enter')
+
+    # 결과 로드 대기
+    page.wait_for_load_state('domcontentloaded')
+
+    # 'Hotels' 탭 클릭
+    hotels_tab_selector = '#searchFilters > ul > li.searchFilter.active'
+    hotels_tab = page.locator(hotels_tab_selector)
+    hotels_tab.wait_for(state='visible', timeout=10000)
+    hotels_tab.click()
+    page.wait_for_load_state('domcontentloaded')
+
+    # 검색 결과에서 'Hotels' 포함 여부 확인 및 첫 번째 결과 클릭
+    search_results_selector = '.searchPage.active h2:has-text("Hotels") + div > a'
+    result_link = page.locator(search_results_selector)
+
+    # 결과 링크가 존재하는지 확인
+    if result_link.count() > 0:
+        # 호텔 이름 저장
+        hotel_name_selector = '.searchPage.active h2:has-text("Hotels") + div > div > a'
+        hotel_name_element = page.locator(hotel_name_selector)
+        if hotel_name_element.is_visible():
+            hotel_name = hotel_name_element.inner_text().strip()
+
+        result_link.first.click()
+        page.wait_for_load_state('domcontentloaded')
+    else:
+        print("검색 결과가 없습니다.")
+        return {
+            'keywords': keyword,
+            'hotel_name': hotel_name,
+            'content': content,
+            'info_blocks': info_blocks_dict
+            # 'extracted_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # 'site': 'forbestravelguide.com'
+        }
+
+    # 'READ MORE' 링크 클릭
+    read_more_selector = 'a.morelink:has-text("READ MORE")'
+    read_more_link = page.locator(read_more_selector)
+
+    if read_more_link.is_visible():
+        read_more_link.click()
+        page.wait_for_load_state('networkidle')
+    else:
+        print("'READ MORE' 링크를 찾을 수 없습니다.")
+
+    # 'READ MORE' 클릭 후 텍스트 추출
+    content_selector = '#contentLeft > div > div.contentBlock.propDescrption.contentWrap.readMore > span.fullContent'
+    content_element = page.locator(content_selector)
+    content = content_element.inner_text()
+
+    # 뷰포트 높이 증가
+    page.set_viewport_size({"width": 1920, "height": 3000})
+
+    # infoBlockWrap 내의 각 요소 클릭 및 데이터 추출
+    info_block_selector = '#contentLeft > div > div.infoBlockWrap > div'
+    info_blocks = page.locator(info_block_selector)
+
+    count = info_blocks.count()
+
+    for i in range(count):
+        info_block = info_blocks.nth(i)
+        if info_block.is_visible():
+            try:
+                # infoBlockTitle 요소 선택
+                info_block_title_selector = 'div.infoBlockTitle.accordion'
+                info_block_title = info_block.locator(info_block_title_selector)
+
+                # 제목이 안정될 때까지 대기
+                info_block_title.wait_for(state='visible', timeout=10000)
+
+                # 요소로 직접 스크롤
+                info_block_title.evaluate("element => element.scrollIntoView(true)")
+                page.wait_for_timeout(500)  # 약간의 대기 시간 추가
+
+                # 제목 텍스트 가져오기
+                title_text = info_block_title.inner_text().strip()
+                print(f"Info Block {i + 1} Text: {title_text}")
+
+                # 제목 클릭하여 내용 펼치기
+                info_block_title.click()
+                page.wait_for_timeout(500)  # 약간의 대기 시간 추가
+
+                # data-target 속성에서 콘텐츠 ID 가져오기
+                data_target = info_block_title.get_attribute('data-target')  # 예: '#ard01'
+
+                try:
+                    page.wait_for_selector(f"{data_target} li", timeout=5000)
+                    # 콘텐츠 영역에서 li 요소들의 텍스트 추출
+                    li_selector = f'{data_target} li'
+                    li_elements = page.locator(li_selector)
+
+                    li_texts = []
+                    li_count = li_elements.count()
+                    print(f"Info Block {i + 1}: Found {li_count} li elements.")
+
+                    for j in range(li_count):
+                        li_text = li_elements.nth(j).inner_text().strip()
+                        li_texts.append(li_text)
+
+                except Exception as e:
+                    # li 요소가 없는 경우 div > span 요소에서 텍스트 추출
+                    span_selector = f'{data_target} > div > div > span'
+                    span_elements = page.locator(span_selector)
+
+                    li_texts = []
+                    span_count = span_elements.count()
+                    print(f"Info Block {i + 1}: Found {span_count} span elements.")
+
+                    for j in range(span_count):
+                        span_text = span_elements.nth(j).inner_text().strip()
+                        li_texts.append(span_text)
+
+                # 디버깅을 위해 li_texts 출력
+                print(f"Info Block {i + 1} li_texts: {li_texts}")
+
+                # 딕셔너리에 추가
+                info_blocks_dict[title_text] = li_texts
+
+            except Exception as e:
+                print(f"Info Block {i + 1} 처리 중 오류 발생: {e}")
+        else:
+            print(f"{i + 1}번째 요소가 보이지 않습니다.")
+
+    # JSON 객체로 데이터 반환
+    result = {
+        'keywords': keyword,
+        'hotel_name': hotel_name,
+        'content': content,
+        'info_blocks': info_blocks_dict
+        # 'extracted_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # 'site': 'forbestravelguide.com'
+    }
+    return result
+
+def safe_scrape_site(url, keyword):
+    try:
+        results = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+
+            page.on('console', lambda msg: logger.info(f"Console: {msg.text}"))
+            page.goto(url)
+
+            if "forbestravelguide.com" in url:
+                result = scrape_forbestravelguide(page, keyword)
+                results.append(result)
+
+                page.goto(url)
+                page.wait_for_load_state('domcontentloaded')
+            else:
+                logger.warning(f"{url}에 대한 스크래핑 코드는 없습니다.")
+
+            browser.close()
+
+        return results
+    except Exception as e:
+        logger.error(f"스크래핑 중 오류 발생 (키워드: {keyword}): {e}")
+        return []
+
+# def process_batch(keywords, urls, max_workers=10):
+#     results = []
+    
+#     # 병렬 처리
+#     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+#         # 키워드와 URL 조합에 대한 future 생성
+#         futures = []
+#         for keyword in keywords:
+#             for url in urls:
+#                 futures.append(executor.submit(safe_scrape_site, url, keyword))
+        
+#         # 결과 수집
+#         for future in concurrent.futures.as_completed(futures):
+#             batch_results = future.result()
+#             results.extend(batch_results)
+    
+#     return results
+
+# def batch_insert_to_bigquery(bq_client, project_id, dataset_id, table_id, results, batch_size=500):
+#     output_table_id = f'{project_id}.{dataset_id}.{table_id}'
+    
+#     job_config = bigquery.LoadJobConfig(
+#         schema=[
+#             bigquery.SchemaField("keywords", "STRING"),
+#             bigquery.SchemaField("hotel_name", "STRING"),
+#             bigquery.SchemaField("content", "STRING"),
+#             bigquery.SchemaField("info_blocks", "STRING")
+#         ],
+#         write_disposition='WRITE_APPEND'  # 기존 데이터에 추가
+#     ) 
+
+#     # JSON 객체를 문자열로 변환
+#     for result in results:
+#         result["info_blocks"] = json.dumps(result["info_blocks"])
+    
+#     # 배치 단위로 데이터 적재
+#     for i in range(0, len(results), batch_size):
+#         batch = results[i:i+batch_size]
+#         try:
+#             job = bq_client.load_table_from_json(
+#                 batch, 
+#                 output_table_id, 
+#                 job_config=job_config
+#             )
+#             job.result()  # 작업 완료 대기
+#             logger.info(f"배치 {i//batch_size + 1} 적재 완료")
+#         except Exception as e:
+#             logger.error(f"배치 적재 중 오류 발생: {e}")
+
+
+
+def gcfIo(request):
+    # 시작 시간 기록
+    start_time = time.time()
+
+    # Cloud Scheduler 요청 파라미터 처리
+    request_json = request.get_json()
+    keyword = request_json.get('keyword')
+
+    # Chromium 설치
+    install_chromium()
+
+    # URLs 설정
+    urls = ["https://www.forbestravelguide.com/"]
+
+    # 단일 키워드 처리
+    final_results = safe_scrape_site(urls[0], keyword)
+
+    # info_blocks를 문자열로 변환 info blocks를 다시 json 파싱하는 결과로 나옴에 따라 해당 부분 주석처리 
+    # for result in final_results:
+    #     result['info_blocks'] = json.dumps(result.get('info_blocks', {}))
+        
+    # 소요 시간 계산
+    end_time = time.time()
+    duration = end_time - start_time
+
+    return json.dumps({
+        "status": "success", 
+        "processed_items": len(final_results),
+        "keyword": keyword,
+        "total_execution_time": f"{duration:.2f} 초",
+        "results": final_results
+    })
+
+
+
