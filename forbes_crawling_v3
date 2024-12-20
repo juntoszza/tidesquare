@@ -1,0 +1,345 @@
+import json
+from playwright.sync_api import sync_playwright
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
+import subprocess
+import logging
+
+ 
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def install_chromium():
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        logger.info("Chromium이 성공적으로 설치되었습니다.")
+    except Exception as e:
+        logger.error(f"Chromium 설치 중 오류 발생: {e}")
+
+def check_scrapability(url):
+    try:
+        # URL 파싱
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+        # robots.txt 확인
+        rp = RobotFileParser()
+        rp.set_url(f"{base_url}/robots.txt")
+        rp.read()
+
+        # User-agent 설정
+        user_agent = 'MyBot'
+
+        # robots.txt에서 허용 여부 확인
+        if not rp.can_fetch(user_agent, url):
+            return False, "robots.txt에 의해 차단됨"
+
+        # 웹사이트 응답 확인
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            response = page.goto(url)
+
+            if response.status >= 400:
+                browser.close()
+                return False, f"HTTP 상태 코드: {response.status}"
+
+            # JavaScript 렌더링 후 콘텐츠 확인
+            page.wait_for_load_state('domcontentloaded')
+            content = page.content()
+
+            browser.close()
+
+        if "접근 거부" in content or "Access Denied" in content:
+            return False, "접근이 거부됨"
+
+        return True, "스크래핑 가능"
+
+    except Exception as e:
+        return False, f"오류 발생: {str(e)}"
+
+def scrape_forbestravelguide(page, keyword):
+    # 데이터 저장을 위한 딕셔너리
+    info_blocks_dict = {}
+    hotel_name = '-'
+    content = '-'
+
+    def close_overlays(page):
+        selectors = [
+            '#cookieConsentAgree',
+            '.modal-close-button',
+        ]
+        for selector in selectors:
+            try:
+                element = page.locator(selector)
+                if element.is_visible():
+                    element.click()
+                    page.wait_for_load_state('domcontentloaded')
+            except Exception as e:
+                print(f"오버레이 닫기 중 오류 발생 ({selector}): {e}")
+
+    close_overlays(page)
+
+    # 뷰포트 크기 설정
+    page.set_viewport_size({"width": 1920, "height": 1080})
+
+    # 검색 입력 필드 선택자 수정
+    search_selector = '#heroSearch input[name="phrase"][placeholder="Where do you want to go?"]'
+    search_input = page.locator(search_selector)
+    # 요소가 가시화될 때까지 대기
+    search_input.wait_for(state='visible', timeout=10000)
+
+    # 검색어 입력
+    search_input.fill(keyword)
+    search_input.press('Enter')
+
+    # 결과 로드 대기
+    page.wait_for_load_state('domcontentloaded')
+
+    # 'Hotels' 탭 클릭
+    hotels_tab_selector = '#searchFilters > ul > li.searchFilter.active'
+    hotels_tab = page.locator(hotels_tab_selector)
+    hotels_tab.wait_for(state='visible', timeout=10000)
+    hotels_tab.click()
+    page.wait_for_load_state('domcontentloaded')
+
+    # 검색 결과에서 'Hotels' 포함 여부 확인 및 첫 번째 결과 클릭
+    search_results_selector = '.searchPage.active h2:has-text("Hotels") + div > a'
+    result_link = page.locator(search_results_selector)
+
+    # 결과 링크가 존재하는지 확인
+    if result_link.count() > 0:
+        # 호텔 이름 저장
+        hotel_name_selector = '.searchPage.active h2:has-text("Hotels") + div > div > a'
+        hotel_name_element = page.locator(hotel_name_selector)
+        if hotel_name_element.is_visible():
+            hotel_name = hotel_name_element.inner_text().strip()
+
+        result_link.first.click()
+        page.wait_for_load_state('domcontentloaded')
+    
+    else:
+        print("검색 결과가 없습니다.")
+
+        # 출력 형식 변경에 따라 주석처리 
+        # return {
+        #     'keywords': keyword,
+        #     'hotel_name': hotel_name,
+        #     'content': content,
+        #     'info_blocks': info_blocks_dict
+        #     # 'extracted_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        #     # 'site': 'forbestravelguide.com'
+        # }
+
+        final_results = {
+            'keywords': keyword,
+            'hotel_name': hotel_name,
+            'content': content,
+            'info_blocks': info_blocks_dict
+        } 
+
+        combined_content = f"{content}, {info_blocks_dict}".strip()    
+
+        final_dict = {
+             "hotel": final_results['hotel_name'],
+            "content": combined_content
+        }
+
+        # 기존 필드 제거
+        del final_results['content']
+        del final_results['info_blocks']
+        del final_results['hotel_name']
+        del final_results['keywords']
+ 
+        # result 필드에 최종 결과 저장
+        final_results['result'] = final_dict
+
+        return final_results
+
+    # 'READ MORE' 링크 클릭
+    read_more_selector = 'a.morelink:has-text("READ MORE")'
+    read_more_link = page.locator(read_more_selector)
+
+    if read_more_link.is_visible():
+        read_more_link.click()
+        page.wait_for_load_state('networkidle')
+    else:
+        print("'READ MORE' 링크를 찾을 수 없습니다.")
+
+    # 'READ MORE' 클릭 후 텍스트 추출
+    content_selector = '#contentLeft > div > div.contentBlock.propDescrption.contentWrap.readMore > span.fullContent'
+    content_element = page.locator(content_selector)
+    content = content_element.inner_text()
+
+    # 뷰포트 높이 증가
+    page.set_viewport_size({"width": 1920, "height": 3000})
+
+    # infoBlockWrap 내의 각 요소 클릭 및 데이터 추출
+    info_block_selector = '#contentLeft > div > div.infoBlockWrap > div'
+    info_blocks = page.locator(info_block_selector)
+
+    count = info_blocks.count()
+
+    for i in range(count):
+        info_block = info_blocks.nth(i)
+        if info_block.is_visible():
+            try:
+                # infoBlockTitle 요소 선택
+                info_block_title_selector = 'div.infoBlockTitle.accordion'
+                info_block_title = info_block.locator(info_block_title_selector)
+
+                # 제목이 안정될 때까지 대기
+                info_block_title.wait_for(state='visible', timeout=10000)
+
+                # 요소로 직접 스크롤
+                info_block_title.evaluate("element => element.scrollIntoView(true)")
+                page.wait_for_timeout(500)  # 약간의 대기 시간 추가
+
+                # 제목 텍스트 가져오기
+                title_text = info_block_title.inner_text().strip()
+                print(f"Info Block {i + 1} Text: {title_text}")
+
+                # 제목 클릭하여 내용 펼치기
+                info_block_title.click()
+                page.wait_for_timeout(500)  # 약간의 대기 시간 추가
+
+                # data-target 속성에서 콘텐츠 ID 가져오기
+                data_target = info_block_title.get_attribute('data-target')  # 예: '#ard01'
+
+                try:
+                    page.wait_for_selector(f"{data_target} li", timeout=5000)
+                    # 콘텐츠 영역에서 li 요소들의 텍스트 추출
+                    li_selector = f'{data_target} li'
+                    li_elements = page.locator(li_selector)
+
+                    li_texts = []
+                    li_count = li_elements.count()
+                    print(f"Info Block {i + 1}: Found {li_count} li elements.")
+
+                    for j in range(li_count):
+                        li_text = li_elements.nth(j).inner_text().strip()
+                        li_texts.append(li_text)
+
+                        # 불필요한 빈 문자열이나 '{}' 제거
+                        li_texts = [t for t in li_texts if t and t.strip() != '{}']
+
+                        # # 디버깅을 위해 li_texts 출력
+                        # print(f"Info Block {i + 1} li_texts: {li_texts}")
+
+
+                except Exception as e:
+                    # li 요소가 없는 경우 div > span 요소에서 텍스트 추출
+                    span_selector = f'{data_target} > div > div > span'
+                    span_elements = page.locator(span_selector)
+
+                    li_texts = []
+                    span_count = span_elements.count()
+                    print(f"Info Block {i + 1}: Found {span_count} span elements.")
+
+                    for j in range(span_count):
+                        span_text = span_elements.nth(j).inner_text().strip()
+                        li_texts.append(span_text)
+                
+                # 딕셔너리에 추가
+                info_blocks_dict[title_text] = li_texts
+
+                # info_blocks_dict를 문자열로 변환
+                transformed_list = []
+                for k, v in info_blocks_dict.items():
+                    # 리스트에서 빈 문자열 또는 '{}' 제거
+                    v = [item for item in v if item.strip() and item.strip() != '{}']
+
+                    if k == "Amenities":
+                        amenities_str = ", ".join(v)
+                        # amenities_str에서 '{}' 제거
+                        amenities_str = amenities_str.replace("{}", "").strip()
+                        transformed_list.append(f"Amenities are {amenities_str}")
+                    else:
+                        non_amenities_str = " ".join(v)
+                        transformed_list.append(non_amenities_str)
+
+                combined_info_text = " ".join(transformed_list).strip()
+                if combined_info_text:
+                    content = f"{content} {combined_info_text}".strip()
+
+            except Exception as e:
+                print(f"Info Block {i + 1} 처리 중 오류 발생: {e}")
+        else:
+            print(f"{i + 1}번째 요소가 보이지 않습니다.")
+
+
+    final_results = {
+        'keywords': keyword,
+        'hotel_name': hotel_name,
+        'content': content,
+        'info_blocks': combined_info_text
+    }
+
+    # info_blocks와 content를 JSON 형태로 합쳐서 result_str 생성
+    combined_content = f"{content}, {combined_info_text}".strip()
+
+     # \uXXXX 제거 및 \ 개행문자 제거
+    combined_content = combined_content.replace('\\u', '').replace('\\', '')
+    combined_content = combined_content.replace('\n', ' ').strip()
+
+
+
+    final_dict = {
+        "hotel": hotel_name,
+        "content": combined_content
+    }
+
+    # 기존 필드 제거
+    del final_results['content']
+    del final_results['info_blocks']
+    del final_results['hotel_name']
+    del final_results['keywords']
+
+
+    # 기존 필드 제거 전 복사
+    final_results['result'] = final_dict
+
+    # 함수 끝에서 결과 반환
+    return final_results
+
+
+
+def gcfIo(request):
+    try:
+        data = request.get_json()
+
+        keyword = data['calls'][0][0]
+
+        # Chromium 설치
+        install_chromium()
+
+        # URLs 설정
+        url = "https://www.forbestravelguide.com/"
+
+        scrapable, reason = check_scrapability(url) 
+
+        if scrapable: 
+            # Playwright를 이용해 브라우저와 페이지 생성
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.goto(url)
+                # 이제 page 객체와 keyword를 전달
+                final_results = scrape_forbestravelguide(page, keyword)
+                browser.close()
+                
+            return json.dumps( { "replies" :  [final_results] },ensure_ascii = False  ) 
+
+        else: 
+            # 스크래핑 불가 시 적절한 메시지 반환
+            return json.dumps({"error": reason}, ensure_ascii=False), 400
+            
+    except Exception as e:
+        return json.dumps({"error": f"{str(e)}"}, ensure_ascii=False), 500
+    
+    
+
+
+
